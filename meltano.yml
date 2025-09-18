@@ -1,0 +1,37 @@
+version: 1
+send_anonymous_usage_stats: false
+plugins:
+  extractors:
+    - name: tap-twitter-api
+      namespace: tap_twitter_api
+      executable: ./tap_twitter_api.sh
+      capabilities:
+        - state
+        - catalog
+        - discover
+      settings:
+        - name: api_key
+          kind: password
+        - name: usernames
+          kind: array
+        - name: hashtags
+          kind: array
+        - name: start_date
+          kind: date_iso8601
+        - name: max_records
+          kind: integer
+      config:
+        api_key: "REDACTED"
+        usernames:
+          - coinlist
+          - binance
+        hashtags:
+          - 0xIntuition
+        start_date: "2025-08-15T00:00:00Z"
+        max_records: 100
+      select:
+        - "*.*"
+  loaders:
+    - name: target-jsonl
+      variant: andyh1203
+      pip_url: target-jsonl

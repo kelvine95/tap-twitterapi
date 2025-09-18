@@ -1,0 +1,7 @@
+{
+  "api_key": "123456",
+  "usernames": ["coinlist", "binance"],
+  "hashtags": ["0xIntuition"],
+  "start_date": "2025-08-15T00:00:00Z",
+  "max_records": 100
+}
