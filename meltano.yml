@@ -21,7 +21,7 @@ plugins:
         - name: max_records
           kind: integer
       config:
-        api_key: "REDACTED"
+        api_key: "123456"
         usernames:
           - coinlist
           - binance
