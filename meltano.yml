@@ -1,37 +1,41 @@
 version: 1
-send_anonymous_usage_stats: false
+default_environment: local
+environments:
+- name: local
+
 plugins:
   extractors:
-    - name: tap-twitter-api
-      namespace: tap_twitterapi
-      executable: ./tap_twitterapi.sh
-      capabilities:
-        - state
-        - catalog
-        - discover
-      settings:
-        - name: api_key
-          kind: password
-        - name: usernames
-          kind: array
-        - name: hashtags
-          kind: array
-        - name: start_date
-          kind: date_iso8601
-        - name: max_records
-          kind: integer
-      config:
-        api_key: "123456"
-        usernames:
-          - coinlist
-          - binance
-        hashtags:
-          - 0xIntuition
-        start_date: "2025-08-15T00:00:00Z"
-        max_records: 100
-      select:
-        - "*.*"
+  - name: tap-twitterapi
+    namespace: tap_twitterapi
+    pip_url: .
+    executable: tap-twitterapi
+    config:
+      api_key: "REDACTED"
+      usernames: [coinlist, binance, okx, LegionNetwork__]
+      hashtags: [0xIntuition]
+      max_parent_tweets: 3
+      max_pages_per_partition: 1
+      max_records_per_partition: 30
+      children_max_per_parent: 2
+      last_tweets_include_replies: false
+      quotes_include_replies: true
+      enable_children: true
+    select:
+    - hashtag_tweets.*
+    - mentions.*
+    - user_tweets.*
+    - tweet_replies.*
+    - tweet_quotes.*
+
   loaders:
-    - name: target-jsonl
-      variant: andyh1203
-      pip_url: target-jsonl
+  - name: target-jsonl
+    variant: andyh1203
+    pip_url: target-jsonl
+    config:
+      destination_path: output
+
+jobs:
+- name: twitterapi-to-jsonl
+  tasks:
+  - tap-twitterapi target-jsonl
+project_id: 8fd716d9-cdfe-4252-942a-98fc2f48c4f9

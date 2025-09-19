@@ -1,21 +1,17 @@
 """Twitter API authentication handling."""
 
-from singer_sdk.authenticators import APIAuthenticatorBase
+from __future__ import annotations
+
+from typing import Dict
+from singer_sdk.authenticators import SimpleAuthenticator
 
 
-class TwitterAuthenticator(APIAuthenticatorBase):
-    """Authenticator for Twitter API."""
-
-    def __init__(self, stream, api_key: str) -> None:
-        """Initialize the authenticator."""
-        super().__init__(stream)
-        self.api_key = api_key
-
-    @property
-    def auth_headers(self) -> dict:
-        """Return the auth headers for Twitter API."""
-        return {
-            "X-API-Key": self.api_key,
-            "Content-Type": "application/json"
-        }
-    
+def build_auth(stream) -> SimpleAuthenticator:
+    """Return SimpleAuthenticator injecting X-API-Key header."""
+    api_key = stream.config.get("api_key")
+    if not api_key:
+        raise RuntimeError("Missing required config: api_key")
+    return SimpleAuthenticator(
+        stream=stream,
+        auth_headers={"X-API-Key": api_key},
+    )

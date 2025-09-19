@@ -137,3 +137,6 @@ dmypy.json
 # other
 .idea
 output
+
+config.json
+.env
