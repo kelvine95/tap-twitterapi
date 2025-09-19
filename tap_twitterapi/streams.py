@@ -5,10 +5,9 @@ from typing import Any, Dict, Optional, Iterable, List
 from singer_sdk import typing as th
 from singer_sdk.streams import RESTStream
 from singer_sdk.helpers.jsonpath import extract_jsonpath
-from tap_twitter_api.auth import TwitterAuthenticator
+from tap_twitterapi.auth import TwitterAuthenticator
 import backoff
 import requests
-
 
 class TwitterStream(RESTStream):
     """Twitter stream base class."""

@@ -3,8 +3,8 @@
 import unittest
 from unittest.mock import patch, MagicMock, Mock
 import json
-from tap_twitter_api.tap import TapTwitter
-from tap_twitter_api.streams import UserInfoStream, UserTweetsStream, HashtagTweetsStream
+from tap_twitterapi.tap import TapTwitter
+from tap_twitterapi.streams import UserInfoStream, UserTweetsStream, HashtagTweetsStream
 
 
 class TestTapTwitter(unittest.TestCase):
@@ -137,7 +137,7 @@ class TestTapTwitter(unittest.TestCase):
         self.assertEqual(records[0]["id"], "tweet123")
         self.assertEqual(records[0]["_tap_username"], "testuser")
 
-    @patch('tap_twitter_api.streams.RESTStream._request')
+    @patch('tap_twitterapi.streams.RESTStream._request')
     def test_mentions_stream(self, mock_request):
         """Test MentionsStream."""
         # Mock response

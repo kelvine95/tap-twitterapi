@@ -3,7 +3,7 @@
 from typing import List
 from singer_sdk import Tap, Stream
 from singer_sdk import typing as th
-from tap_twitter_api.streams import (
+from tap_twitterapi.streams import (
     UserInfoStream,
     UserTweetsStream,
     MentionsStream,

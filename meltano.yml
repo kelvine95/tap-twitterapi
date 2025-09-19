@@ -3,8 +3,8 @@ send_anonymous_usage_stats: false
 plugins:
   extractors:
     - name: tap-twitter-api
-      namespace: tap_twitter_api
-      executable: ./tap_twitter_api.sh
+      namespace: tap_twitterapi
+      executable: ./tap_twitterapi.sh
       capabilities:
         - state
         - catalog
