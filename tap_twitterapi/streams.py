@@ -1,6 +1,7 @@
 """Stream type classes for tap-twitter-api."""
 
 import datetime
+from datetime import timezone
 from typing import Any, Dict, Optional, Iterable, List
 from singer_sdk import typing as th
 from singer_sdk.streams import RESTStream
@@ -28,6 +29,46 @@ class TwitterStream(RESTStream):
         if self.authenticator:
             headers.update(self.authenticator.auth_headers)
         return headers
+
+    @staticmethod
+    def _coerce_datetime_iso(dt_str: str) -> str:
+        """Convert Twitter-style or ISO-ish strings to RFC3339 UTC (…Z).
+        Returns the original value on failure.
+        """
+        if not isinstance(dt_str, str) or not dt_str.strip():
+            return dt_str
+        s = dt_str.strip()
+
+        # Fast path: already ISO — normalize to Z
+        if "T" in s:
+            try:
+                # allow both 'Z' and '+00:00'
+                iso = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+                return iso.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            except Exception:
+                pass
+
+        # Twitter-style: 'Mon Sep 15 00:12:16 +0000 2025'
+        try:
+            parsed = datetime.datetime.strptime(s, "%a %b %d %H:%M:%S %z %Y")
+            return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        except Exception:
+            return dt_str  # leave as-is if we can't parse
+    
+    def post_process(self, row: dict, context: dict | None) -> dict:
+        """Normalize fields after parsing but before emission."""
+        rec = dict(row)
+
+        # Top-level createdAt
+        if "createdAt" in rec and isinstance(rec["createdAt"], str):
+            rec["createdAt"] = self._coerce_datetime_iso(rec["createdAt"])
+
+        # Nested author.createdAt if present
+        author = rec.get("author")
+        if isinstance(author, dict) and isinstance(author.get("createdAt"), str):
+            author["createdAt"] = self._coerce_datetime_iso(author["createdAt"])
+
+        return rec
 
     def get_url_params(
         self, context: Optional[dict], next_page_token: Optional[Any]
