@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import csv
-import math
-import time
-import calendar
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -18,7 +14,7 @@ from .auth import build_auth
 # ============================================================
 
 def _tweet_schema_properties(include_ctx: bool = True, include_parent: bool = False) -> th.PropertiesList:
-    """Return a PropertiesList matching twitterapi.io tweet object (superset) + context + snapshot."""
+    """twitterapi.io tweet object (superset) + context + snapshot marker."""
     props = [
         th.Property("type", th.StringType),
         th.Property("id", th.StringType),
@@ -179,7 +175,7 @@ def _tweet_schema_properties(include_ctx: bool = True, include_parent: bool = Fa
 # ============================================================
 
 class TwitterAPIStream(RESTStream):
-    """Base stream with helpers, credit control, stateful refresh queue, and sane defaults."""
+    """Base: helpers, budgeting, stateful 48h refresh scheduling."""
     url_base = "https://api.twitterapi.io"
 
     primary_keys = ["id"]
@@ -195,7 +191,7 @@ class TwitterAPIStream(RESTStream):
     def backoff_max_tries(self) -> int:
         return 5
 
-    # ------------- Helpers -------------
+    # ---- time helpers ----
     def _now(self) -> datetime:
         return datetime.now(timezone.utc)
 
@@ -210,7 +206,6 @@ class TwitterAPIStream(RESTStream):
             return None
 
     def _start_unix(self) -> Optional[int]:
-        # Prefer bookmark; fallback to config since_time if provided.
         v = self.get_starting_replication_key_value(context=None)
         if v:
             unix_v = self._iso_to_unix(v) or (int(v) if str(v).isdigit() else None)
@@ -224,15 +219,13 @@ class TwitterAPIStream(RESTStream):
         cfg = self.config.get("until_time")
         if cfg:
             return self._iso_to_unix(cfg) or None
-        # else, allow min_age gating:
         h = self.config.get("min_tweet_age_hours")
         if isinstance(h, int) and h > 0:
             return int((self._now() - timedelta(hours=h)).timestamp())
         return None
 
     def _build_date_query_part(self, since_unix: Optional[int], until_unix: Optional[int]) -> str:
-        """Build the date portion of an advanced search query."""
-        parts = []
+        parts: List[str] = []
         if since_unix:
             dt_since = datetime.fromtimestamp(since_unix, tz=timezone.utc)
             parts.append(f"since:{dt_since.strftime('%Y-%m-%d_%H:%M:%S')}_UTC")
@@ -250,17 +243,12 @@ class TwitterAPIStream(RESTStream):
             resp.raise_for_status()
         return resp.json()
 
-    # ------------- Snapshot + refresh scheduling -------------
-
-    def _schedule_one_time_refresh(self, tweet_row: dict) -> None:
-        """Schedule a one-time refresh of this tweet exactly once at +refresh_delay_hours."""
-        if not tweet_row:
-            return
-        tid = str(tweet_row.get("id") or "").strip()
-        created_iso = tweet_row.get("createdAt")
+    # ---- single 48h refresh scheduling in state ----
+    def _schedule_one_time_refresh(self, row: dict) -> None:
+        tid = str(row.get("id") or "").strip()
+        created_iso = row.get("createdAt")
         if not tid or not created_iso:
             return
-
         created_unix = self._iso_to_unix(created_iso)
         if not created_unix:
             return
@@ -268,69 +256,58 @@ class TwitterAPIStream(RESTStream):
         delay_h = int(self.config.get("refresh_delay_hours", 48))
         due_unix = created_unix + delay_h * 3600
 
-        state = dict(self.tap.state or {})
-        rstate = state.get("tweet_refresh") or {"queue": {}, "done": {}}
+        tap = self._tap  # accurate access in Singer SDK
+        state: Dict[str, Any] = dict(tap.state or {})
+        rstate: Dict[str, Any] = state.get("tweet_refresh") or {"queue": {}, "done": {}}
 
-        # If already done, never requeue
         if tid in rstate.get("done", {}):
             return
-        # If already queued, don't duplicate
         if tid in rstate.get("queue", {}):
             return
 
         rstate["queue"][tid] = {"due": due_unix, "attempts": 0, "created": created_unix}
-        # prune old done entries (>30d)
+
+        # prune done older than 30d
         cutoff = self._now_unix() - 30 * 86400
         done = rstate.get("done", {})
         for k, v in list(done.items()):
-            if isinstance(v, dict):
-                ts = v.get("ts") or 0
-            else:
-                ts = int(v) if str(v).isdigit() else 0
+            ts = (v or {}).get("ts", 0) if isinstance(v, dict) else (int(v) if str(v).isdigit() else 0)
             if ts and ts < cutoff:
                 done.pop(k, None)
         rstate["done"] = done
 
         state["tweet_refresh"] = rstate
-        self.tap.state = state  # trigger state emission
+        tap.state = state
 
     def post_process(self, row: Dict[str, Any], context: Optional[dict] = None) -> Dict[str, Any]:
         context = context or {}
-        # context-aware columns
         row.setdefault("_ctx_username", context.get("_ctx_username"))
         row.setdefault("_ctx_hashtag", context.get("_ctx_hashtag"))
         if "parentTweetId" in context and "parentTweetId" not in row:
             row["parentTweetId"] = context["parentTweetId"]
-        # stamp when we fetched this
         row["_snapshot_ts"] = self._now().isoformat().replace("+00:00", "Z")
 
-        # Schedule a single refresh at +48h (or configured) for original tweets and children alike.
-        # (If you want parents only, add: if not row.get("isReply"): ...)
         try:
+            # schedule one-time refresh at +refresh_delay_hours (defaults to 48h)
             self._schedule_one_time_refresh(row)
         except Exception as e:
-            self.logger.debug("schedule_one_time_refresh failed: %s", e)
+            self.logger.debug("refresh scheduling failed: %s", e)
 
         return row
 
-    # ------------- Budget/credits helpers -------------
-
+    # ---- budgeting hooks ----
     def _consume_and_check(self, count: int, category: str) -> int:
-        """Consume up to 'count' tweets from the global budget for category.
-        Returns how many are actually allowed."""
         if count <= 0:
             return 0
-        return self.tap.runtime.consume_tweets(count, category)
+        return self._tap.runtime.consume_tweets(count, category)
 
 
 # ============================================================
-# Parent streams (fair-share budget across all parents)
+# Parent streams (fair-share)
 # ============================================================
 
 class HashtagTweetsStream(TwitterAPIStream):
-    """Tweets by hashtag via Advanced Search, fair-sharing budget across all parent partitions."""
     name = "hashtag_tweets"
-
     schema = _tweet_schema_properties(include_ctx=True).to_dict()
     schema["additionalProperties"] = True
 
@@ -339,64 +316,52 @@ class HashtagTweetsStream(TwitterAPIStream):
         if not tags:
             return []
 
-        # register these partitions with the global runtime for fair-sharing
-        self.tap.runtime.register_parent_partitions(len(tags))
+        # register partitions for fair sharing (across all parents)
+        self._tap.runtime.register_parent_partitions(len(tags))
 
         since_unix = self._start_unix()
         until_unix = self._until_unix() or self._now_unix()
 
         for tag in tags:
-            # allowance for this partition
-            part_allowance = self.tap.runtime.allowance_for_next_parent_partition()
+            part_allowance = self._tap.runtime.allowance_for_next_parent_partition()
             if part_allowance <= 0:
                 break
 
-            emitted_for_tag = 0
             cursor = ""
-            pages = 0
-
             while part_allowance > 0:
+                q = f"#{tag}"
                 date_part = self._build_date_query_part(since_unix, until_unix)
-                query = f"#{tag}" + (f" {date_part}" if date_part else "")
-                params = {"query": query, "queryType": "Latest", "cursor": cursor}
+                if date_part:
+                    q = f"{q} {date_part}"
 
-                data = self._http_get("/twitter/tweet/advanced_search", params)
+                data = self._http_get("/twitter/tweet/advanced_search",
+                                      {"query": q, "queryType": "Latest", "cursor": cursor})
                 tweets = data.get("tweets") or []
-
                 if not tweets:
                     break
 
-                # cap to remaining budget for this partition
                 to_emit = min(len(tweets), part_allowance)
-                # also cap by global budget consumption
-                allowed = self._consume_and_check(to_emit, category="parent")
+                allowed = self._consume_and_check(to_emit, "parent")
                 if allowed <= 0:
-                    # no budget left globally
                     return
 
                 for t in tweets[:allowed]:
                     t["_ctx_hashtag"] = tag
                     t["_ctx_username"] = None
                     yield t
-                    emitted_for_tag += 1
                     part_allowance -= 1
                     if part_allowance <= 0:
                         break
 
                 if part_allowance <= 0 or not data.get("has_next_page"):
                     break
-
                 cursor = data.get("next_cursor") or ""
                 if not cursor:
                     break
 
-                pages += 1
-
 
 class MentionsStream(TwitterAPIStream):
-    """Mentions of a user (by username), fair-shared with other parents."""
     name = "mentions"
-
     schema = _tweet_schema_properties(include_ctx=True).to_dict()
     schema["additionalProperties"] = True
 
@@ -405,19 +370,17 @@ class MentionsStream(TwitterAPIStream):
         if not usernames:
             return []
 
-        self.tap.runtime.register_parent_partitions(len(usernames))
+        self._tap.runtime.register_parent_partitions(len(usernames))
 
         since_unix = self._start_unix()
         until_unix = self._until_unix() or self._now_unix()
 
         for uname in usernames:
-            part_allowance = self.tap.runtime.allowance_for_next_parent_partition()
+            part_allowance = self._tap.runtime.allowance_for_next_parent_partition()
             if part_allowance <= 0:
                 break
 
-            emitted_for_user = 0
             cursor = ""
-
             while part_allowance > 0:
                 params = {"userName": uname, "cursor": cursor}
                 if since_unix:
@@ -431,7 +394,7 @@ class MentionsStream(TwitterAPIStream):
                     break
 
                 to_emit = min(len(tweets), part_allowance)
-                allowed = self._consume_and_check(to_emit, category="parent")
+                allowed = self._consume_and_check(to_emit, "parent")
                 if allowed <= 0:
                     return
 
@@ -439,7 +402,6 @@ class MentionsStream(TwitterAPIStream):
                     t["_ctx_username"] = uname
                     t["_ctx_hashtag"] = None
                     yield t
-                    emitted_for_user += 1
                     part_allowance -= 1
                     if part_allowance <= 0:
                         break
@@ -452,9 +414,7 @@ class MentionsStream(TwitterAPIStream):
 
 
 class UserTweetsStream(TwitterAPIStream):
-    """Tweets by username: Advanced Search + Last Tweets (de-duped), fair-shared with other parents."""
     name = "user_tweets"
-
     schema = _tweet_schema_properties(include_ctx=True).to_dict()
     schema["additionalProperties"] = True
 
@@ -464,34 +424,35 @@ class UserTweetsStream(TwitterAPIStream):
             return []
 
         include_replies_last = bool(self.config.get("last_tweets_include_replies", False))
-        self.tap.runtime.register_parent_partitions(len(usernames))
+        self._tap.runtime.register_parent_partitions(len(usernames))
 
         since_unix = self._start_unix()
         until_unix = self._until_unix() or self._now_unix()
 
         for uname in usernames:
-            part_allowance = self.tap.runtime.allowance_for_next_parent_partition()
+            part_allowance = self._tap.runtime.allowance_for_next_parent_partition()
             if part_allowance <= 0:
                 break
 
             seen_ids: set[str] = set()
 
-            # 1) Advanced search (from:username)
+            # (1) advanced_search from:username
             cursor = ""
             while part_allowance > 0:
+                q = f"from:{uname}"
                 date_part = self._build_date_query_part(since_unix, until_unix)
-                query = f"from:{uname}" + (f" {date_part}" if date_part else "")
-                params = {"query": query, "queryType": "Latest", "cursor": cursor}
+                if date_part:
+                    q = f"{q} {date_part}"
 
-                data = self._http_get("/twitter/tweet/advanced_search", params)
+                data = self._http_get("/twitter/tweet/advanced_search",
+                                      {"query": q, "queryType": "Latest", "cursor": cursor})
                 tweets = data.get("tweets") or []
                 if not tweets:
                     break
 
-                # de-dupe + allow
                 new_tweets = [t for t in tweets if str(t.get("id") or "") not in seen_ids]
                 to_emit = min(len(new_tweets), part_allowance)
-                allowed = self._consume_and_check(to_emit, category="parent")
+                allowed = self._consume_and_check(to_emit, "parent")
                 if allowed <= 0:
                     return
 
@@ -507,12 +468,11 @@ class UserTweetsStream(TwitterAPIStream):
 
                 if part_allowance <= 0 or not data.get("has_next_page"):
                     break
-
                 cursor = data.get("next_cursor") or ""
                 if not cursor:
                     break
 
-            # 2) Last tweets as a top-up (only if we still have allowance)
+            # (2) last_tweets as a top-up
             if part_allowance > 0:
                 cursor = ""
                 while part_allowance > 0:
@@ -524,7 +484,7 @@ class UserTweetsStream(TwitterAPIStream):
 
                     new_tweets = [t for t in tweets if str(t.get("id") or "") not in seen_ids]
                     to_emit = min(len(new_tweets), part_allowance)
-                    allowed = self._consume_and_check(to_emit, category="parent")
+                    allowed = self._consume_and_check(to_emit, "parent")
                     if allowed <= 0:
                         return
 
@@ -558,11 +518,9 @@ class UserTweetsStream(TwitterAPIStream):
 # ============================================================
 
 class TweetRepliesStream(TwitterAPIStream):
-    """Replies for parent tweet (budgeted as 'child')."""
     name = "tweet_replies"
     parent_stream_type = UserTweetsStream
     state_partitioning_keys = ["parentTweetId"]
-
     schema = _tweet_schema_properties(include_ctx=True, include_parent=True).to_dict()
     schema["additionalProperties"] = True
 
@@ -587,7 +545,7 @@ class TweetRepliesStream(TwitterAPIStream):
             if not replies:
                 break
 
-            allowed = self._consume_and_check(len(replies), category="child")
+            allowed = self._consume_and_check(len(replies), "child")
             if allowed <= 0:
                 return
 
@@ -605,11 +563,9 @@ class TweetRepliesStream(TwitterAPIStream):
 
 
 class TweetQuotesStream(TwitterAPIStream):
-    """Quotes for parent tweet (budgeted as 'child')."""
     name = "tweet_quotes"
     parent_stream_type = UserTweetsStream
     state_partitioning_keys = ["parentTweetId"]
-
     schema = _tweet_schema_properties(include_ctx=True, include_parent=True).to_dict()
     schema["additionalProperties"] = True
 
@@ -635,7 +591,7 @@ class TweetQuotesStream(TwitterAPIStream):
             if not quotes:
                 break
 
-            allowed = self._consume_and_check(len(quotes), category="child")
+            allowed = self._consume_and_check(len(quotes), "child")
             if allowed <= 0:
                 return
 
@@ -657,24 +613,24 @@ class TweetQuotesStream(TwitterAPIStream):
 # ============================================================
 
 class TweetRefreshStream(TwitterAPIStream):
-    """Rehydrate tweets exactly once, when due (createdAt + refresh_delay_hours)."""
     name = "tweet_refresh"
-
     schema = _tweet_schema_properties(include_ctx=False).to_dict()
     schema["additionalProperties"] = True
 
     def _load_refresh_state(self) -> Dict[str, Any]:
-        state = dict(self.tap.state or {})
+        tap = self._tap
+        state = dict(tap.state or {})
         return state.get("tweet_refresh") or {"queue": {}, "done": {}}
 
     def _save_refresh_state(self, rstate: Dict[str, Any]) -> None:
-        state = dict(self.tap.state or {})
+        tap = self._tap
+        state = dict(tap.state or {})
         state["tweet_refresh"] = rstate
-        self.tap.state = state
+        tap.state = state
 
     def _pick_due_ids(self, rstate: Dict[str, Any], max_ids: int) -> List[str]:
         now_u = self._now_unix()
-        due = []
+        due: List[str] = []
         for tid, meta in rstate.get("queue", {}).items():
             due_ts = int(meta.get("due") or 0)
             if due_ts and due_ts <= now_u:
@@ -690,10 +646,8 @@ class TweetRefreshStream(TwitterAPIStream):
         if not rstate.get("queue"):
             return []
 
-        # while budget allows and there are due ids, fetch in batches
         while True:
-            # respect budget for "refresh"
-            max_batch_allowed = self._consume_and_check(batch_size, category="refresh")
+            max_batch_allowed = self._consume_and_check(batch_size, "refresh")
             if max_batch_allowed <= 0:
                 break
 
@@ -701,43 +655,32 @@ class TweetRefreshStream(TwitterAPIStream):
             if not ids:
                 break
 
-            # call lookup
-            params = {"tweet_ids": ",".join(ids)}
-            data = self._http_get("/twitter/tweets", params)
+            data = self._http_get("/twitter/tweets", {"tweet_ids": ",".join(ids)})
             tweets = data.get("tweets") or []
 
-            # Emit
             for t in tweets:
                 yield t
 
-            # Mark done (only for those returned) and prune from queue
             now_ts = self._now_unix()
             done = rstate.get("done", {})
-            for t in tweets:
-                tid = str(t.get("id"))
+            returned_ids = {str(t.get("id")) for t in tweets}
+
+            # mark returned as done, remove from queue
+            for tid in list(returned_ids):
                 rstate["queue"].pop(tid, None)
                 done[tid] = {"ts": now_ts}
-            rstate["done"] = done
 
-            self._save_refresh_state(rstate)
-
-            # If fewer than requested returned, remove remaining ids after 3 attempts to avoid infinite loop
-            returned_ids = {str(t.get("id")) for t in tweets}
+            # handle missing (backoff 24h, give up after 3 attempts)
             missing = [i for i in ids if i not in returned_ids]
-            if missing:
-                for mid in missing:
-                    meta = rstate["queue"].get(mid) or {}
-                    meta["attempts"] = int(meta.get("attempts", 0)) + 1
-                    # backoff 24h for next try
+            for mid in missing:
+                meta = rstate["queue"].get(mid) or {}
+                meta["attempts"] = int(meta.get("attempts", 0)) + 1
+                if meta["attempts"] >= 3:
+                    rstate["queue"].pop(mid, None)
+                    done[mid] = {"ts": now_ts, "status": "gave_up"}
+                else:
                     meta["due"] = self._now_unix() + 24 * 3600
-                    if meta["attempts"] >= 3:
-                        # give up gracefully
-                        rstate["queue"].pop(mid, None)
-                        rstate["done"][mid] = {"ts": now_ts, "status": "gave_up"}
-                    else:
-                        rstate["queue"][mid] = meta
-                self._save_refresh_state(rstate)
+                    rstate["queue"][mid] = meta
 
-            if len(tweets) < max_batch_allowed:
-                # might still have more due; continue
-                continue
+            rstate["done"] = done
+            self._save_refresh_state(rstate)
